@@ -26,4 +26,5 @@ def real_to_complex(tensor):
 
     Returns:
         complex valued tensor of shape (...,)."""
-    return tf.complex(tensor[..., 0], tensor[..., 1])
+    return tf.complex(tf.gather(tensor, 0, axis=-1),
+                      tf.gather(tensor, 1, axis=-1))
