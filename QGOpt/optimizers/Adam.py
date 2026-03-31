@@ -1,19 +1,10 @@
 import QGOpt.manifolds as m
-from tensorflow.python.keras.optimizer_v2 import optimizer_v2 as opt
 import tensorflow as tf
+import types
 
-from tensorflow.python.keras import initializers
-# from tensorflow.python.distribute import distribution_strategy_context as distribute_ctx
-from tensorflow import distribute as distribute_ctx
-from tensorflow.python.ops import variables as tf_variables
-from tensorflow.python.keras import backend
-
-import functools
-import six
-
-
-class RAdam(opt.OptimizerV2):
+class RAdam(tf.keras.optimizers.Optimizer):
     """Riemannain Adam and AMSGrad optimizers. Returns a new optimizer.
+    Updated from QGOpt to work with tensorflow 2.17.
 
     Args:
         manifold: object of the class Manifold, marks a particular manifold.
@@ -22,7 +13,7 @@ class RAdam(opt.OptimizerV2):
             Defaults to 0.9.
         beta2: real number. An exponential decay rate for the second moment.
             Defaults to 0.999.
-        eps: real number. Regularization coeffitient. Defaults to 1e-8.
+        eps: real number. Regularization coefficient. Defaults to 1e-8.
         ams: boolean number. Use ams (AMSGrad) or not.
         name: Optional name prefix for the operations created when applying
             gradients.  Defaults to 'RAdam'.
@@ -42,103 +33,84 @@ class RAdam(opt.OptimizerV2):
                  beta2=0.999,
                  eps=1e-8,
                  ams=False,
-                 name="RAdam"):
+                 name="RAdam",
+                 **kwargs):
 
-        super(RAdam, self).__init__(name)
-        self.manifold = manifold
-        self.iter = 0
+        super().__init__(
+            learning_rate=learning_rate,
+            name=name,
+            **kwargs)
         self.eps = eps
-        self._set_hyper('learning_rate', learning_rate)
-
+        # manifold could be dict when loading model
+        if isinstance(manifold, dict):
+            self.manifold = m.StiefelManifold(**manifold['config'])
+        else:
+            self.manifold = manifold
+        # make manifold keras compatible
+        def get_config(self):
+            return {'retraction': self._retraction,
+                    'metric': self._metric}
+        self.manifold.get_config = types.MethodType(get_config, self.manifold)
+        
         if isinstance(beta1, (int, float)) and (beta1 < 0 or beta1 > 1):
             raise ValueError("`beta1` must be between [0, 1].")
-        self._set_hyper('beta1', beta1)
+        self.beta1 = beta1
         if isinstance(beta2, (int, float)) and (beta2 < 0 or beta2 > 1):
             raise ValueError("`beta2` must be between [0, 1].")
-        self._set_hyper('beta2', beta2)
+        self.beta2 = beta2
 
         self.ams = ams
 
-    # TODO explain why we update this method
-    def add_slot(self, var, slot_name, initializer="zeros",
-                 manifold_wise=False):
-        rank = self.manifold.rank  # rank of tensot of a manifold
-        """Add a new slot variable for `var`."""
-        if slot_name not in self._slot_names:
-          self._slot_names.append(slot_name)
-        var_key = opt._var_key(var)
-        slot_dict = self._slots.setdefault(var_key, {})
-        weight = slot_dict.get(slot_name, None)
-        if weight is None:
-          if isinstance(initializer, six.string_types) or callable(initializer):
-            initializer = initializers.get(initializer)
-            if manifold_wise:
-                initial_value = functools.partial(
-                    initializer, shape=var.shape[:-rank - 1] + rank * (1,) + (2,),
-                    dtype=var.dtype)
-            else:
-                initial_value = functools.partial(
-                    initializer, shape=var.shape, dtype=var.dtype)
-          else:
-            initial_value = initializer
-          strategy = distribute_ctx.get_strategy()
-          if not strategy.extended.variable_created_in_scope(var):
-            raise ValueError(
-                "Trying to create optimizer slot variable under the scope for "
-                "tf.distribute.Strategy ({}), which is different from the scope "
-                "used for the original variable ({}). Make sure the slot "
-                "variables are created under the same strategy scope. This may "
-                "happen if you're restoring from a checkpoint outside the scope"
-                .format(strategy, var))
-    
-          with strategy.extended.colocate_vars_with(var):
-            weight = tf_variables.Variable(
-                name="%s/%s" % (var._shared_name, slot_name),  # pylint: disable=protected-access
-                dtype=var.dtype,
-                trainable=False,
-                initial_value=initial_value)
-          backend.track_variable(weight)
-          slot_dict[slot_name] = weight
-          self._restore_slot_variable(
-              slot_name=slot_name, variable=var,
-              slot_variable=weight)
-          self._weights.append(weight)
-        return weight
-
-    def _create_slots(self, var_list):
-        # Create m and v slots
+    def build(self, var_list):
+        if self.built:
+            return
+        super().build(var_list)
+        self._momentums = []
+        self._velocities = []
         for var in var_list:
-            self.add_slot(var, "momentum")
-            self.add_slot(var, "v", manifold_wise=True)
-            if self.ams:
-                self.add_slot(var, "v_hat", manifold_wise=True)
-
-    def _resource_apply_dense(self, grad, var):
-
-        self.iter = self.iter + 1
-
+            self._momentums.append(
+                self.add_variable_from_reference(
+                    reference_variable=var, name="momentum"
+                )
+            )
+            self._velocities.append(
+                self.add_variable_from_reference(
+                    reference_variable=var, name="velocity"
+                )
+            )
+        if self.ams:
+            self._velocity_hats = []
+            for var in var_list:
+                self._velocity_hats.append(
+                    self.add_variable_from_reference(
+                        reference_variable=var, name="velocity_hat"
+                    )
+                )
+    
+    def update_step(self, gradient, variable, learning_rate):
         # Complex version of grad and var
-        complex_var = m.real_to_complex(var)
-        complex_grad = m.real_to_complex(grad)
+        complex_var = m.real_to_complex(variable)
+        complex_grad = m.real_to_complex(gradient)
 
-        # learning rate
-        lr = tf.cast(self._get_hyper("learning_rate"), complex_grad.dtype)
+        # learning rate and iter
+        lr = tf.cast(learning_rate, complex_grad.dtype)
+        iterations = tf.cast(self.iterations + 1, complex_grad.dtype)
 
         # Riemannian gradient
         rgrad = self.manifold.egrad_to_rgrad(complex_var, complex_grad)
 
         # Complex versions of m and v
-        momentum = self.get_slot(var, "momentum")
-        v = self.get_slot(var, "v")
+        momentum = self._momentums[self._get_variable_index(variable)]
+        v = self._velocities[self._get_variable_index(variable)]
         if self.ams:
-            v_hat = self.get_slot(var, "v_hat")
+            v_hat = self._velocity_hats[self._get_variable_index(variable)]
             v_hat_complex = m.real_to_complex(v_hat)
         momentum_complex = m.real_to_complex(momentum)
         v_complex = m.real_to_complex(v)
 
         # Update m, v and v_hat
-        beta1 = tf.cast(self._get_hyper("beta1"), dtype=momentum_complex.dtype)
-        beta2 = tf.cast(self._get_hyper("beta2"), dtype=momentum_complex.dtype)
+        beta1 = tf.cast(self.beta1, dtype=momentum_complex.dtype)
+        beta2 = tf.cast(self.beta2, dtype=momentum_complex.dtype)
         momentum_complex = beta1 * momentum_complex +\
             (1 - beta1) * rgrad
         v_complex = beta2 * v_complex +\
@@ -151,8 +123,8 @@ class RAdam(opt.OptimizerV2):
             v_hat_complex = tf.cast(v_hat_complex, dtype=v_complex.dtype)
 
         # Bias correction
-        lr_corr = lr * tf.math.sqrt(1 - beta2 ** self.iter) /\
-            (1 - beta1 ** self.iter)
+        lr_corr = lr * tf.math.sqrt(1 - beta2 ** iterations) /\
+            (1 - beta1 ** iterations)
 
         # New value of var
         if self.ams:
@@ -180,19 +152,15 @@ class RAdam(opt.OptimizerV2):
             v_hat.assign(m.complex_to_real(v_hat_complex))
 
         # Update of var
-        var.assign(m.complex_to_real(new_var))
-
-    def _resource_apply_sparse(self, grad, var):
-        raise NotImplementedError("Sparse gradient updates are not supported.")
-
+        variable.assign(m.complex_to_real(new_var))
+    
     def get_config(self):
-        config = super(RAdam, self).get_config()
+        config = super().get_config()
         config.update({
-            "learning_rate": self._serialize_hyperparameter("learning_rate"),
-            "beta1": self._serialize_hyperparameter("beta1"),
-            "beta2": self._serialize_hyperparameter("beta2"),
+            "beta1": self.beta1,
+            "beta2": self.beta2,
             "eps": self.eps,
-            "iter": self.iter,
+            "ams": self.ams,
             "manifold": self.manifold
         })
         return config
